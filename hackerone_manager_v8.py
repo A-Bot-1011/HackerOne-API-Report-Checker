@@ -13,10 +13,11 @@ import traceback
 # --- CONFIGURATION ---
 CONFIG_FILE = "team_config_v8.json"
 
+# DEFAULT DATA
 DEFAULT_DATA = {
-    "api_id": "",
-    "api_token": "",
-    "program_handle": "xiaomi",
+    "api_id": "",          
+    "api_token": "",       
+    "program_handle": "",
     "use_hai": False,
     "members": [], 
     "history": []
@@ -26,7 +27,7 @@ class H1ManagerApp(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("HackerOne Manager V8 - Assignment Debugger")
+        self.title("HackerOne Manager V15 - Auto Sync Users")
         self.geometry("1250x900")
         
         self.data = self.load_data()
@@ -61,13 +62,15 @@ class H1ManagerApp(tk.Tk):
                 json.dump(DEFAULT_DATA, f, indent=4)
             return DEFAULT_DATA
         else:
-            with open(CONFIG_FILE, 'r') as f:
-                d = json.load(f)
-                if "history" not in d: d["history"] = []
-                if "use_hai" not in d: d["use_hai"] = False
-                for m in d.get('members', []):
-                    if m.get('team') == "Unassigned": m['team'] = "N/A"
-                return d
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    d = json.load(f)
+                    if "history" not in d: d["history"] = []
+                    if "use_hai" not in d: d["use_hai"] = False
+                    if "members" not in d: d["members"] = []
+                    return d
+            except:
+                return DEFAULT_DATA
 
     def save_data(self):
         with open(CONFIG_FILE, 'w') as f:
@@ -90,7 +93,7 @@ class H1ManagerApp(tk.Tk):
         self.chk_hai = ttk.Checkbutton(scan_frame, text="🧠 Enable Hai (AI)", variable=self.var_hai, command=self.save_ai_toggle)
         self.chk_hai.pack(side='left', padx=15)
 
-        # --- NEW: MANUAL OVERRIDE DEBUGGER ---
+        # --- MANUAL OVERRIDE DEBUGGER ---
         debug_frame = ttk.LabelFrame(self.tab_dashboard, text="🛠️ Manual Override (Test Assignment)", padding=10)
         debug_frame.pack(fill='x', padx=10, pady=5)
 
@@ -98,7 +101,7 @@ class H1ManagerApp(tk.Tk):
         self.ent_debug_rid = ttk.Entry(debug_frame, width=15)
         self.ent_debug_rid.pack(side='left', padx=5)
 
-        ttk.Label(debug_frame, text="User ID:").pack(side='left', padx=5)
+        ttk.Label(debug_frame, text="User ID (Numeric):").pack(side='left', padx=5)
         self.ent_debug_uid = ttk.Entry(debug_frame, width=15)
         self.ent_debug_uid.pack(side='left', padx=5)
 
@@ -123,70 +126,65 @@ class H1ManagerApp(tk.Tk):
         self.data['use_hai'] = self.var_hai.get()
         self.save_data()
 
-    # --- MANUAL ASSIGN DEBUGGER ---
     def force_assign_debug(self):
         rid = self.ent_debug_rid.get().strip()
-        uid = self.ent_debug_uid.get().strip()
+        user_input = self.ent_debug_uid.get().strip()
         
-        if not rid or not uid:
-            messagebox.showerror("Error", "Enter both IDs")
+        if not rid or not user_input:
+            messagebox.showerror("Error", "Enter both Report ID and User ID")
             return
             
-        self.log(f"🛠️ FORCING ASSIGNMENT: Report #{rid} -> User {uid}")
+        self.log(f"🛠️ FORCING ASSIGNMENT: Report #{rid} -> User '{user_input}'")
         
-        # Call the assignment function but handle UI updates manually here
-        success = self.assign_api_call(rid, uid)
-        
-        if success:
-            self.log("✅ Force Assignment Successful.")
-            # Update internal counter if user exists in DB
-            for m in self.data['members']:
-                if str(m['id']) == str(uid):
-                    m['count'] += 1
+        try:
+            if self.assign_api_call(rid, user_input):
+                self.log("✅ Force Assignment Successful.")
+                # We ALSO post the comment on manual force
+                self.post_public_comment(rid)
+                
+                found = False
+                for m in self.data['members']:
+                    if str(m['id']) == user_input:
+                        m['count'] += 1
+                        found = True
+                if found:
                     self.save_data()
                     self.refresh_table()
-                    self.log(f"   Updated load for {m['name']} to {m['count']}")
-        else:
-            self.log("❌ Force Assignment FAILED. Check log for API response.")
+            else:
+                self.log("❌ Force Assignment FAILED. Check log.")
+        except Exception as e:
+            self.log(f"🔥 CRITICAL ERROR: {e}")
+            traceback.print_exc()
 
-    # --- HAI AI LOGIC (INFRASTRUCTURE OVERRIDE) ---
+    # --- HAI AI LOGIC ---
     def ask_hai_category(self, report_id):
+        self.log(f"      🧠 Asking Hai to categorize Report #{report_id}...")
+        
         url_create = "https://api.hackerone.com/v1/hai/chat/completions"
         prompt = (
-            "You are a Senior Security Architect. Route this report to: 'WEB', 'MOBILE', or 'IOT'.\n\n"
-            "🚨 CRITICAL OVERRIDE: Ignore the 'Asset Type' label (e.g., AndroidApk) if the technical evidence shows a Server-Side issue.\n\n"
-            "1. WEB (Backend Infrastructure): \n"
-            "   - ANY issue involving Server Software: Apache Tomcat, Nginx, IIS, OpenSSL, HAProxy.\n"
-            "   - ANY issue on Backend APIs/Gateways: 'api.*', 'push.*', 'register.*', 'gateway.*'.\n"
-            "   - Vulnerabilities: HTTP Request Smuggling, Server Version Disclosure, SQLi, SSRF.\n"
-            "   - LOGIC: If the fix requires updating a Server, it is WEB.\n\n"
-            "2. MOBILE (Client Binary):\n"
-            "   - Issues residing strictly inside the .APK or .IPA file.\n"
-            "   - Examples: Hardcoded API keys in strings.xml, Insecure Data Storage on SD Card, Deeplink Logic Errors.\n"
-            "   - LOGIC: If the fix requires releasing an App Store update, it is MOBILE.\n\n"
-            "3. IOT (Hardware/Firmware):\n"
-            "   - Physical devices, Firmware (.bin), MQTT, RTSP, Serial Console.\n\n"
-            "SPECIFIC EXAMPLE: An 'Apache Tomcat' vulnerability on 'xmpush.xiaomi.com' is WEB (Server Infra), NOT Mobile.\n"
-            "Classify based on the Technology Stack (Server vs Client). Reply with ONE word."
+            "Analyze the report context linked to this request. "
+            "Categorize this report into exactly one of these three teams: 'WEB', 'MOBILE', or 'IOT'. "
+            "Reply with ONLY the single word category name. Do not add punctuation."
         )
 
         try:
             r_id = int(report_id)
         except:
+            self.log("      ❌ Error: Report ID must be an integer for Hai.")
             return None
 
+        # 1. CREATE JOB
         payload = {
             "data": {
                 "type": "completion-request",
                 "attributes": {
                     "messages": [{"role": "user", "content": prompt}],
-                    "report_ids": [r_id]
+                    "report_ids": [r_id] 
                 }
             }
         }
 
         try:
-            self.log(f"      📡 Sending Data to Hai (Infra Mode)...")
             resp = requests.post(
                 url_create, 
                 json=payload, 
@@ -195,42 +193,87 @@ class H1ManagerApp(tk.Tk):
             )
             
             if resp.status_code not in [200, 201]:
-                self.log(f"      ❌ Hai Status: {resp.status_code}")
+                self.log(f"      ❌ Hai Request Failed: {resp.status_code}")
                 return None
 
             r_json = resp.json()
-            if isinstance(r_json['data'], list):
-                job_id = r_json['data'][0]['id']
-            else:
-                job_id = r_json['data']['id']
-
-            self.log(f"      ⏳ Hai Analyzing (Job {job_id})...")
+            if isinstance(r_json['data'], list): job_data = r_json['data'][0]
+            else: job_data = r_json['data']
             
+            job_id = job_data['id']
+            self.log(f"      ⏳ Hai Job {job_id} Created. Polling...")
+
+            # 2. POLL
             for i in range(10):
                 time.sleep(2) 
+                check_url = f"https://api.hackerone.com/v1/hai/chat/completions/{job_id}"
                 check = requests.get(
-                    f"https://api.hackerone.com/v1/hai/chat/completions/{job_id}",
+                    check_url,
                     auth=HTTPBasicAuth(self.data['api_id'], self.data['api_token']),
                     headers={"Accept": "application/json"}
                 )
                 
                 if check.status_code == 200:
                     c_json = check.json()
-                    if isinstance(c_json['data'], list):
-                        attrs = c_json['data'][0]['attributes']
-                    else:
-                        attrs = c_json['data']['attributes']
+                    if isinstance(c_json['data'], list): attrs = c_json['data'][0]['attributes']
+                    else: attrs = c_json['data']['attributes']
                     
                     state = attrs.get('state')
-                    if state in ['created', 'completed']:
+                    if state in ['completed', 'success']:
                         answer = attrs.get('response', '').strip().upper()
-                        return answer.replace('.', '').replace("'", "")
+                        answer = answer.replace('.', '').replace("'", "").replace('"', "")
+                        
+                        if "WEB" in answer: return "web"
+                        if "MOBILE" in answer: return "mobile"
+                        if "IOT" in answer: return "iot"
+                        
+                        self.log(f"      ❓ Hai returned unknown category: {answer}")
+                        return "web" 
+                        
                     elif state == 'failed':
+                        self.log("      ❌ Hai Analysis Failed.")
                         return None
+            self.log("      ❌ Hai Timed Out.")
             return None
+
         except Exception as e:
-            self.log(f"      ❌ Hai Error: {e}")
+            self.log(f"      ❌ Hai Exception: {e}")
             return None
+
+    # --- AUTO COMMENT FUNCTION ---
+    def post_public_comment(self, report_id):
+        self.log(f"   💬 Posting public comment to Report #{report_id}...")
+        url = f"https://api.hackerone.com/v1/reports/{report_id}/activities"
+        
+        message_text = (
+            "Thank you for bringing this to our attention. "
+            "We have received your report and are now validating the issue internally. "
+            "We will get back to you soon."
+        )
+
+        payload = {
+            "data": {
+                "type": "activity-comment",
+                "attributes": {
+                    "message": message_text,
+                    "internal": False 
+                }
+            }
+        }
+
+        try:
+            r = requests.post(
+                url, 
+                json=payload,
+                auth=HTTPBasicAuth(self.data['api_id'], self.data['api_token']),
+                headers={"Content-Type": "application/json", "Accept": "application/json"}
+            )
+            if r.status_code in [200, 201]:
+                self.log("   ✅ Comment Posted Successfully.")
+            else:
+                self.log(f"   ⚠️ Comment Failed ({r.status_code}): {r.text}")
+        except Exception as e:
+            self.log(f"   ⚠️ Comment Error: {e}")
 
     # --- TAB 2: USER MANAGEMENT ---
     def setup_team_management(self):
@@ -239,8 +282,11 @@ class H1ManagerApp(tk.Tk):
 
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill='x', pady=(0, 5))
-        ttk.Button(btn_frame, text="1. 📂 Import Master CSV", command=self.import_internal_csv).pack(side='left', padx=2)
-        ttk.Button(btn_frame, text="2. 🔗 Sync H1 IDs", command=self.import_h1_ids).pack(side='left', padx=2)
+        
+        # --- NEW SYNC BUTTON ---
+        ttk.Button(btn_frame, text="🔄 Sync Users from H1", command=self.sync_h1_users_thread).pack(side='left', padx=2)
+        
+        ttk.Button(btn_frame, text="📂 Import CSV", command=self.import_internal_csv).pack(side='left', padx=2)
         ttk.Button(btn_frame, text="📤 Export Table", command=self.export_table_csv).pack(side='left', padx=20)
         
         filter_frame = ttk.Frame(main_frame); filter_frame.pack(fill='x', pady=(0, 10))
@@ -252,12 +298,12 @@ class H1ManagerApp(tk.Tk):
         ttk.Button(filter_frame, text="✏️ Edit User", command=self.edit_current_user_popup).pack(side='right', padx=2)
         ttk.Button(btn_frame, text="🗑️ Delete Selected", command=self.mass_delete).pack(side='right', padx=2)
 
-        columns = ("active", "h1_name", "real_name", "team", "role", "load", "h1_id")
+        columns = ("active", "h1_name", "email", "team", "role", "load", "h1_id")
         self.tree = ttk.Treeview(main_frame, columns=columns, show='headings', selectmode='extended')
         for c in columns: self.tree.heading(c, text=c.title(), command=lambda _c=c: self.sort_tree(_c))
         self.tree.column("active", width=60, anchor='center'); self.tree.column("h1_name", width=150)
-        self.tree.column("real_name", width=100); self.tree.column("team", width=80)
-        self.tree.column("role", width=200); self.tree.column("load", width=50, anchor='center'); self.tree.column("h1_id", width=80)
+        self.tree.column("email", width=200); self.tree.column("team", width=80)
+        self.tree.column("role", width=100); self.tree.column("load", width=50, anchor='center'); self.tree.column("h1_id", width=80)
 
         scrollbar = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscroll=scrollbar.set)
@@ -270,6 +316,105 @@ class H1ManagerApp(tk.Tk):
         ttk.Button(edit_frame, text="Apply Batch", command=self.save_batch_edit).pack(side='right', padx=20)
         self.refresh_table()
 
+    # --- NEW: SYNC USERS LOGIC ---
+    def sync_h1_users_thread(self):
+        threading.Thread(target=self.sync_h1_users, daemon=True).start()
+
+    def sync_h1_users(self):
+        self.log("🔄 Starting User Sync...")
+        
+        if not self.data['api_id'] or not self.data['api_token']:
+            self.log("❌ Error: Missing API Credentials.")
+            return
+
+        auth = HTTPBasicAuth(self.data['api_id'], self.data['api_token'])
+        
+        # Step 1: Get Organization ID
+        try:
+            self.log("   1. Fetching Organization ID...")
+            r_org = requests.get('https://api.hackerone.com/v1/me/organizations', auth=auth, headers={'Accept': 'application/json'})
+            if r_org.status_code != 200:
+                self.log(f"   ❌ Failed to get Org ID: {r_org.status_code}")
+                return
+            
+            orgs = r_org.json().get('data', [])
+            if not orgs:
+                self.log("   ❌ No organizations found.")
+                return
+            
+            # Use the first organization found
+            org_id = orgs[0]['id']
+            org_name = orgs[0]['attributes'].get('handle', 'Unknown')
+            self.log(f"   ✅ Found Org: {org_name} (ID: {org_id})")
+
+        except Exception as e:
+            self.log(f"   ❌ Network Error: {e}")
+            return
+
+        # Step 2: Fetch Members
+        self.log("   2. Fetching Members...")
+        members_url = f"https://api.hackerone.com/v1/organizations/{org_id}/members"
+        
+        new_count = 0
+        update_count = 0
+        
+        try:
+            # Handle Pagination loop
+            while members_url:
+                r_mem = requests.get(members_url, auth=auth, headers={'Accept': 'application/json'})
+                if r_mem.status_code != 200:
+                    self.log(f"   ❌ Error fetching members: {r_mem.status_code}")
+                    break
+                
+                data = r_mem.json()
+                member_list = data.get('data', [])
+                
+                for m in member_list:
+                    attrs = m.get('attributes', {})
+                    
+                    # API Data
+                    h1_username = attrs.get('username')
+                    h1_email = attrs.get('email')
+                    h1_user_id = attrs.get('user_id') # Crucial for assignment
+                    
+                    if not h1_username: continue
+
+                    # Check if user exists in local DB
+                    existing = next((x for x in self.data['members'] if x['name'] == h1_username), None)
+                    
+                    if existing:
+                        # Update existing
+                        if existing['id'] != str(h1_user_id) or existing.get('email') != h1_email:
+                            existing['id'] = str(h1_user_id)
+                            existing['email'] = h1_email
+                            update_count += 1
+                    else:
+                        # Create new
+                        new_member = {
+                            "name": h1_username,
+                            "email": h1_email,
+                            "id": str(h1_user_id),
+                            "team": "N/A", # User must manually set team later
+                            "role": "Member",
+                            "active": True,
+                            "count": 0
+                        }
+                        self.data['members'].append(new_member)
+                        new_count += 1
+                
+                # Check for next page
+                links = data.get('links', {})
+                members_url = links.get('next') # Will be None if no more pages
+
+            self.save_data()
+            self.after(0, self.refresh_table) # Update UI safely
+            self.log(f"   ✅ Sync Complete: {new_count} new, {update_count} updated.")
+            messagebox.showinfo("Sync Complete", f"Found {new_count} new users.\nUpdated {update_count} existing users.\n\nPlease assign Teams manually.")
+
+        except Exception as e:
+            self.log(f"   ❌ Sync Error: {e}")
+            traceback.print_exc()
+
     def edit_current_user_popup(self, event=None):
         selected = self.tree.selection()
         if not selected: return
@@ -281,62 +426,34 @@ class H1ManagerApp(tk.Tk):
         f = ttk.Frame(top, padding=20); f.pack(fill='both', expand=True)
         ttk.Label(f, text="Nickname:").pack(anchor='w'); e_name = ttk.Entry(f); e_name.insert(0, member['name']); e_name.pack(fill='x', pady=5)
         ttk.Label(f, text="H1 ID:").pack(anchor='w'); e_id = ttk.Entry(f); e_id.insert(0, member['id']); e_id.pack(fill='x', pady=5)
-        ttk.Label(f, text="Real Name:").pack(anchor='w'); e_real = ttk.Entry(f); e_real.insert(0, member.get('real_name', '')); e_real.pack(fill='x', pady=5)
+        ttk.Label(f, text="Email:").pack(anchor='w'); e_real = ttk.Entry(f); e_real.insert(0, member.get('email', '')); e_real.pack(fill='x', pady=5)
         ttk.Label(f, text="Team:").pack(anchor='w'); e_team = ttk.Combobox(f, values=["N/A", "web", "mobile", "iot"], state="readonly"); e_team.set(member['team']); e_team.pack(fill='x', pady=5)
         ttk.Label(f, text="Role:").pack(anchor='w'); e_role = ttk.Entry(f); e_role.insert(0, member.get('role', '')); e_role.pack(fill='x', pady=5)
         ttk.Label(f, text="Load:").pack(anchor='w'); e_load = ttk.Spinbox(f, from_=0, to=999); e_load.set(member['count']); e_load.pack(fill='x', pady=5)
         var_active = tk.BooleanVar(value=member['active']); ttk.Checkbutton(f, text="Active", variable=var_active).pack(anchor='w', pady=10)
 
         def save_and_close():
-            member['name'] = e_name.get(); member['id'] = e_id.get().strip(); member['real_name'] = e_real.get()
+            member['name'] = e_name.get(); member['id'] = e_id.get().strip(); member['email'] = e_real.get()
             member['team'] = e_team.get(); member['role'] = e_role.get(); member['count'] = int(e_load.get())
             member['active'] = var_active.get(); self.save_data(); self.refresh_table(); top.destroy()
         ttk.Button(f, text="💾 Save", command=save_and_close).pack(fill='x', pady=20)
 
     # --- LOGIC: IMPORTS/EXPORTS/TABLE ---
     def import_internal_csv(self):
-        filepath = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All", "*.*")])
-        if not filepath: return
-        if not messagebox.askyesno("Confirm", "Overwrite list?"): return
-        try:
-            new_members = []
-            with open(filepath, 'r', encoding='utf-8-sig', errors='replace') as f:
-                reader = csv.DictReader(f); reader.fieldnames = [str(n).strip() for n in reader.fieldnames]
-                for row in reader:
-                    nick = row.get('昵称') or row.get('username') or row.get('User Name')
-                    if not nick: continue
-                    role = row.get('权限') or row.get('role') or ""
-                    team = "N/A"
-                    role_u = role.upper()
-                    if "WEB" in role_u: team = "web"
-                    elif "IOT" in role_u or "硬件" in role_u: team = "iot"
-                    elif "APP" in role_u or "MOBILE" in role_u: team = "mobile"
-                    new_members.append({"name": nick.strip(), "real_name": row.get('name') or row.get('姓名') or "", "role": role, "team": team, "id": "", "active": True, "count": 0})
-            self.data['members'] = new_members; self.save_data(); self.refresh_table()
-            messagebox.showinfo("Success", f"Imported {len(new_members)} users.")
-        except Exception as e: messagebox.showerror("Error", str(e))
+        # Placeholder for CSV import if needed
+        pass
 
     def import_h1_ids(self):
-        filepath = filedialog.askopenfilename(filetypes=[("CSV", "*.csv")])
-        if not filepath: return
-        try:
-            matched = 0
-            with open(filepath, 'r', encoding='utf-8-sig') as f:
-                reader = csv.DictReader(f); reader.fieldnames = [str(n).strip() for n in reader.fieldnames]
-                if 'user_id' not in reader.fieldnames: messagebox.showerror("Error", "Need 'user_id'"); return
-                for row in reader:
-                    for m in self.data['members']:
-                        if m['name'] == row.get('username'): m['id'] = row.get('user_id'); matched += 1
-            self.save_data(); self.refresh_table(); messagebox.showinfo("Success", f"Synced IDs for {matched} users.")
-        except Exception as e: messagebox.showerror("Error", str(e))
+        # Placeholder
+        pass
 
     def export_table_csv(self):
         filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
         if not filepath: return
         try:
             with open(filepath, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f); writer.writerow(["Active", "Nickname", "Real Name", "Team", "Role", "Load", "H1 ID"])
-                for m in self.data['members']: writer.writerow([m['active'], m['name'], m.get('real_name',''), m['team'], m.get('role',''), m['count'], m['id']])
+                writer = csv.writer(f); writer.writerow(["Active", "Nickname", "Email", "Team", "Role", "Load", "H1 ID"])
+                for m in self.data['members']: writer.writerow([m['active'], m['name'], m.get('email',''), m['team'], m.get('role',''), m['count'], m['id']])
             messagebox.showinfo("Success", "Exported.")
         except Exception as e: messagebox.showerror("Error", str(e))
 
@@ -358,7 +475,7 @@ class H1ManagerApp(tk.Tk):
             if self.current_filter == "N/A" and m['team'] != "N/A": continue
             if self.current_filter == "Missing H1 ID" and (m['id'] == "" or m['id'] == "0"): continue
             status = "✅" if m['active'] else "❌"; h1_id = "⚠️ MISSING" if (m['id'] == "" or m['id'] == "0") else m['id']
-            self.tree.insert("", "end", values=(status, m['name'], m.get('real_name', '-'), m['team'].upper(), m.get('role', '-'), m['count'], h1_id))
+            self.tree.insert("", "end", values=(status, m['name'], m.get('email', '-'), m['team'].upper(), m.get('role', '-'), m['count'], h1_id))
 
     def save_batch_edit(self):
         selected = self.tree.selection(); new_team = self.combo_team.get(); new_active = self.var_active_edit.get()
@@ -370,7 +487,7 @@ class H1ManagerApp(tk.Tk):
 
     def mass_delete(self):
         selected = self.tree.selection()
-        if not selected or not messagebox.askyesno("Confirm", "Delete?"): return
+        if not selected or not messagebox.askyesno("Confirm", "Delete selected?"): return
         names = [self.tree.item(i)['values'][1] for i in selected]
         self.data['members'] = [m for m in self.data['members'] if m['name'] not in names]
         self.save_data(); self.refresh_table()
@@ -384,10 +501,13 @@ class H1ManagerApp(tk.Tk):
         txt = scrolledtext.ScrolledText(top); txt.pack(fill='both', expand=True)
         for i in reversed(self.data.get('history', [])): txt.insert(tk.END, f"[{i['date']}] Report #{i['report_id']} -> {i['assignee']} ({i['team']})\n")
 
-    # --- SCANNING & ASSIGNMENT ---
+    # --- SETTINGS & SCANNING ---
     def save_settings_ui(self):
-        self.data['api_id'] = self.ent_api_id.get(); self.data['api_token'] = self.ent_api_token.get(); self.data['program_handle'] = self.ent_program.get()
-        self.save_data(); messagebox.showinfo("Saved", "Settings saved.")
+        self.data['api_id'] = self.ent_api_id.get()
+        self.data['api_token'] = self.ent_api_token.get()
+        self.data['program_handle'] = self.ent_program.get()
+        self.save_data()
+        messagebox.showinfo("Saved", "Settings saved.")
 
     def setup_settings(self):
         f = ttk.Frame(self.tab_settings, padding=20); f.pack(fill='both')
@@ -412,6 +532,11 @@ class H1ManagerApp(tk.Tk):
 
     def perform_scan(self):
         self.log(f"🔍 Scanning {self.data['program_handle']}...")
+        if not self.data['api_id'] or not self.data['api_token']:
+            self.log("❌ Error: Credentials missing in Settings.")
+            self.reset_scan_btn()
+            return
+
         try:
             resp = requests.get("https://api.hackerone.com/v1/reports", 
                 params={"filter[program][]": self.data['program_handle'], "filter[state][]": "new", "page[size]": 100},
@@ -443,19 +568,15 @@ class H1ManagerApp(tk.Tk):
         if self.data.get('use_hai', False):
             ai_choice = self.ask_hai_category(r_id)
             if ai_choice:
-                if "MOBILE" in ai_choice: ai_team = "mobile"
-                elif "IOT" in ai_choice or "HARDWARE" in ai_choice: ai_team = "iot"
-                elif "WEB" in ai_choice: ai_team = "web"
-                else: ai_team = None
-
-                if ai_team and ai_team != team_type:
-                    self.log(f"      ⚠️ AI Disagreement! Bot: {team_type.upper()}, Hai: {ai_team.upper()}")
-                    team_type = ai_team
-                elif ai_team: self.log(f"      ✅ AI Confirmed: {ai_team.upper()}")
+                if ai_choice != team_type:
+                    self.log(f"      ⚠️ Hai Override! Regular: {team_type.upper()} -> Hai: {ai_choice.upper()}")
+                    team_type = ai_choice
+                else:
+                    self.log(f"      ✅ Hai Confirmed: {ai_choice.upper()}")
         
         self.log(f"   ➤ Final Category: {team_type.upper()}")
 
-        # FILTER: Must have ID and be active
+        # Ensure we only pick members who have a Valid ID
         eligible = [m for m in self.data['members'] if m['team'] == team_type and m['active'] and m['id'] and m['id'] != "0"]
         
         if not eligible: self.log(f"   ❌ No active members with valid IDs for {team_type}."); return
@@ -463,48 +584,60 @@ class H1ManagerApp(tk.Tk):
         best = sorted(eligible, key=lambda x: x['count'])[0]
         self.log(f"   ➤ Assigning to {best['name']}")
 
+        # We pass the ID directly now
         if self.assign_api_call(r_id, best['id']):
+            # --- SUCCESS! POST COMMENT AND SAVE ---
+            self.post_public_comment(r_id)
+            
             best['count'] += 1
             self.data['history'].append({"date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "report_id": r_id, "assignee": best['name'], "team": team_type})
-            self.save_data(); self.refresh_table()
+            self.save_data()
+            self.refresh_table()
             self.log(f"   ✅ Assigned.")
 
-    # --- UPDATED ASSIGNMENT LOGIC (DEBUG MODE) ---
-    def assign_api_call(self, report_id, user_id):
-        url = f"https://api.hackerone.com/v1/reports/{report_id}"
+    # --- API CALL (PUT METHOD) ---
+    def assign_api_call(self, report_id, user_input):
+        user_input = str(user_input).strip()
+        r_id = str(report_id)
+
+        self.log(f"   🚀 Assigning Report #{r_id}...")
+
+        if not user_input.isdigit():
+             self.log("   ❌ Error: The API requires a Numeric User ID for this endpoint.")
+             return False
         
-        # Ensure user_id is a string
+        url = f"https://api.hackerone.com/v1/reports/{r_id}/assignee"
+        
         payload = {
             "data": {
-                "type": "report",
-                "relationships": {
-                    "assignee": {
-                        "data": {
-                            "type": "user", 
-                            "id": str(user_id) # Ensure String
-                        }
-                    }
-                }
+                "type": "user",
+                "id": int(user_input)
             }
         }
         
         try:
-            r = requests.patch(
+            if not self.data['api_id'] or not self.data['api_token']:
+                self.log("❌ Error: Missing Credentials.")
+                return False
+
+            r = requests.put(
                 url, 
-                json=payload, 
+                json=payload,
                 auth=HTTPBasicAuth(self.data['api_id'], self.data['api_token']),
                 headers={"Content-Type": "application/json", "Accept": "application/json"}
             )
-            
-            # --- DEBUGGING: PRINT THE REAL REASON ---
-            if r.status_code == 200:
+
+            if r.status_code == 200: 
+                self.log("   ✅ Assignment Success!")
                 return True
-            else:
-                self.log(f"   ❌ Assignment API Failed (Status {r.status_code})")
-                self.log(f"   📜 Details: {r.text}") # <--- THIS IS KEY
-                return False
+
+            self.log(f"   ❌ Failed. Status: {r.status_code}")
+            self.log(f"   📝 Response: {r.text}")
+            return False
+
         except Exception as e:
             self.log(f"   ❌ API Crash: {e}")
+            traceback.print_exc()
             return False
 
 if __name__ == "__main__":
