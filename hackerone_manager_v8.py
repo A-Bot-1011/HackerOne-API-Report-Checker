@@ -11,14 +11,18 @@ from datetime import datetime
 import traceback
 
 # --- CONFIGURATION ---
-CONFIG_FILE = "team_config_v9.json"
+CONFIG_FILE = "team_config_v8.json"
+
+DEFAULT_MSG = "Thank you for bringing this to our attention. We have received your report and are now validating the issue internally. We will get back to you soon."
 
 DEFAULT_DATA = {
     "api_id": "",          
     "api_token": "",       
     "program_handle": "",
+    "lark_webhook": "",   # NEW: Stores the Feishu URL
     "use_hai": False,
     "ai_threshold": 80,
+    "comment_template": DEFAULT_MSG,
     "members": [], 
     "history": []
 }
@@ -27,7 +31,7 @@ class H1ManagerApp(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("HackerOne Automation Hub V24 - Auto-Retry & Summary")
+        self.title("HackerOne Automation Hub V26 - Lark/Feishu Integration")
         self.geometry("1400x900")
         
         # --- STYLE ---
@@ -82,6 +86,8 @@ class H1ManagerApp(tk.Tk):
                     d = json.load(f)
                     if "members" not in d: d["members"] = []
                     if "ai_threshold" not in d: d["ai_threshold"] = 80
+                    if "comment_template" not in d: d["comment_template"] = DEFAULT_MSG
+                    if "lark_webhook" not in d: d["lark_webhook"] = ""
                     return d
             except:
                 return DEFAULT_DATA
@@ -137,7 +143,7 @@ class H1ManagerApp(tk.Tk):
         self.log_box.tag_config("ERROR", foreground="#e74c3c")   
         self.log_box.tag_config("WARN", foreground="#f1c40f")    
         self.log_box.tag_config("AI", foreground="#3498db")      
-        self.log_box.tag_config("SUMMARY", foreground="#9b59b6") # Purple for summary
+        self.log_box.tag_config("SUMMARY", foreground="#9b59b6")
 
         # Manual Override
         override_frame = ttk.LabelFrame(self.tab_dashboard, text="Manual Assignment Override", padding=15)
@@ -178,10 +184,20 @@ class H1ManagerApp(tk.Tk):
             messagebox.showerror("Error", "Enter both IDs")
             return
         self.log(f"Manual Override: Report #{rid} -> User '{user_input}'", "WARN")
+        
+        # 1. Assign
         if self.assign_api_call(rid, user_input):
+            # 2. Comment
             self.post_public_comment(rid)
+            
+            # 3. Notification
+            username = "Unknown"
             for m in self.data['members']:
-                if str(m['id']) == user_input: m['count'] += 1
+                if str(m['id']) == user_input:
+                    m['count'] += 1
+                    username = m['name']
+            
+            self.send_lark_notification(rid, username, "Manual")
             self.save_data()
             self.refresh_table()
 
@@ -341,9 +357,7 @@ class H1ManagerApp(tk.Tk):
                 if unassigned: 
                     self.log(f"🚨 Found {len(unassigned)} unassigned reports.", "WARN")
                     for r in unassigned: 
-                        # Capture return status from process_report
                         res, retries = self.process_report(r)
-                        
                         stats['retried_ai'] += retries
                         if res == "assigned": stats['assigned'] += 1
                         elif res == "skipped_ai": stats['skipped_ai'] += 1
@@ -353,7 +367,6 @@ class H1ManagerApp(tk.Tk):
         except Exception as e: 
             self.log(f"Scan Exception: {e}", "ERROR")
         
-        # --- BATCH SUMMARY ---
         if stats['found'] > 0:
             self.log("-" * 40, "SUMMARY")
             self.log(f"📊 SCAN SUMMARY", "SUMMARY")
@@ -375,27 +388,21 @@ class H1ManagerApp(tk.Tk):
         team_type = None 
         retries_used = 0
         
-        # --- AI LOGIC WITH RETRY ---
         if self.data.get('use_hai', False):
-            # Try up to 3 times if format/confidence fails
             for attempt in range(1, 4):
                 cat, conf, reason = self.ask_hai_category(r_id)
-                
-                # Check Confidence
                 min_thresh = self.data.get('ai_threshold', 80)
                 
                 if cat and conf >= min_thresh:
-                    # Success
                     team_type = cat.lower()
                     self.log(f"🧠 AI: {cat} (Confidence: {conf}%)", "AI")
                     self.log(f"📝 Reason: {reason}", "AI")
-                    break # Exit retry loop
+                    break 
                 else:
                     retries_used += 1
                     if attempt < 3:
                         self.log(f"⚠️ AI Uncertain (Conf: {conf}%). Retrying {attempt}/3...", "WARN")
                     else:
-                        # Final Fail
                         self.log(f"❌ FAIL SAFE: AI Failed after 3 attempts.", "ERROR")
                         self.log("   -> Action: Skipped for later.", "WARN")
                         return "skipped_ai", retries_used
@@ -403,7 +410,6 @@ class H1ManagerApp(tk.Tk):
         if not team_type and self.data.get('use_hai', False):
              return "skipped_ai", retries_used
 
-        # Fallback for non-AI mode? (Defaulting to web is risky, so we stick to strict)
         if not team_type: team_type = "web" 
 
         eligible = [m for m in self.data['members'] if m['team'] == team_type and m['active'] and m['id']]
@@ -417,6 +423,7 @@ class H1ManagerApp(tk.Tk):
 
         if self.assign_api_call(r_id, best['id']):
             self.post_public_comment(r_id)
+            self.send_lark_notification(r_id, best['name'], team_type) # LARK CALL
             best['count'] += 1
             self.data['history'].append({"date": datetime.now().strftime("%Y-%m-%d %H:%M"), "report_id": r_id, "assignee": best['name'], "team": team_type})
             self.save_data()
@@ -425,6 +432,26 @@ class H1ManagerApp(tk.Tk):
             return "assigned", retries_used
         
         return "error", retries_used
+
+    # --- LARK INTEGRATION ---
+    def send_lark_notification(self, report_id, assignee, team):
+        webhook = self.data.get('lark_webhook', '')
+        if not webhook: return # Silent fail if no webhook set
+
+        text = f"📢 **New Report Assigned!**\nReport: #{report_id}\nAssignee: {assignee}\nTeam: {team.upper()}"
+        
+        payload = {
+            "msg_type": "text",
+            "content": {
+                "text": text
+            }
+        }
+        
+        try:
+            requests.post(webhook, json=payload, headers={'Content-Type': 'application/json'})
+            self.log("   🔔 Feishu Alert Sent", "INFO")
+        except Exception as e:
+            self.log(f"   ❌ Feishu Error: {e}", "ERROR")
 
     def ask_hai_category(self, r_id):
         try:
@@ -451,7 +478,6 @@ class H1ManagerApp(tk.Tk):
                     if state == 'completed':
                         raw = check.json()['data']['attributes']['response'].strip()
                         
-                        # --- PARSING LOGIC ---
                         cat = None
                         conf = 0
                         reason = "No reason provided"
@@ -491,9 +517,11 @@ class H1ManagerApp(tk.Tk):
 
     def post_public_comment(self, report_id):
         try:
+            message = self.data.get('comment_template', DEFAULT_MSG)
+            if not message.strip(): message = DEFAULT_MSG
+
             url = f"https://api.hackerone.com/v1/reports/{report_id}/activities"
-            msg = "Thank you for bringing this to our attention. We have received your report and are now validating the issue internally. We will get back to you soon."
-            payload = {"data": {"type": "activity-comment", "attributes": {"message": msg, "internal": False}}}
+            payload = {"data": {"type": "activity-comment", "attributes": {"message": message, "internal": False}}}
             requests.post(url, json=payload, auth=HTTPBasicAuth(self.data['api_id'], self.data['api_token']))
         except: pass
 
@@ -599,6 +627,8 @@ class H1ManagerApp(tk.Tk):
         self.data['api_id'] = self.ent_api_id.get()
         self.data['api_token'] = self.ent_api_token.get()
         self.data['program_handle'] = self.ent_program.get()
+        self.data['lark_webhook'] = self.ent_lark.get() # Save webhook
+        self.data['comment_template'] = self.txt_comment.get("1.0", tk.END).strip()
         self.save_data()
         messagebox.showinfo("Saved", "Settings saved.")
 
@@ -611,6 +641,19 @@ class H1ManagerApp(tk.Tk):
         self.ent_api_token = ttk.Entry(f, show="*"); self.ent_api_token.insert(0, self.data['api_token']); self.ent_api_token.pack(fill=tk.X, pady=5)
         ttk.Label(f, text="Program Handle:").pack(anchor=tk.W)
         self.ent_program = ttk.Entry(f); self.ent_program.insert(0, self.data['program_handle']); self.ent_program.pack(fill=tk.X, pady=5)
+        
+        # Lark Webhook
+        ttk.Label(f, text="Feishu/Lark Webhook URL:").pack(anchor=tk.W, pady=(15, 0))
+        self.ent_lark = ttk.Entry(f); self.ent_lark.insert(0, self.data.get('lark_webhook', '')); self.ent_lark.pack(fill=tk.X, pady=5)
+
+        # New Comment Section
+        ttk.Label(f, text="Automated Public Reply Message:").pack(anchor=tk.W, pady=(15, 5))
+        self.txt_comment = scrolledtext.ScrolledText(f, height=5, font=("Arial", 10))
+        self.txt_comment.pack(fill=tk.X)
+        
+        current_msg = self.data.get('comment_template', DEFAULT_MSG)
+        self.txt_comment.insert(tk.END, current_msg)
+
         ttk.Button(f, text="Save Settings", command=self.save_settings_ui).pack(pady=20)
 
     def import_internal_csv(self):
@@ -619,8 +662,7 @@ class H1ManagerApp(tk.Tk):
             try:
                 with open(filepath, 'r', encoding='utf-8-sig') as f:
                     reader = csv.DictReader(f)
-                    for row in reader:
-                        pass
+                    for row in reader: pass
                 self.refresh_table()
             except: pass
 
